@@ -170,18 +170,20 @@ def run_workflow(
         for step in phase.steps:
             emit(events.STEP_START, id=step.id, subagent=step.subagent_type)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            # Run each step in a copy of the current context so worker threads
-            # inherit callbacks and tracing; emit step_done from this (the tool's)
-            # thread as each settles, so events reach the stream in real time.
-            def _go(step: WorkflowStep) -> tuple[str, str, dict[str, Any]]:
-                text, step_delta = contextvars.copy_context().run(_run_step_core, runnables[step.subagent_type], step, working, results, private_keys)
-                return step.id, text, step_delta
-
-            futures = {pool.submit(_go, s): s.id for s in phase.steps}
+            # copy_context() is evaluated HERE (the tool's thread), where the
+            # parent run's callbacks/tracing live, then handed to the worker via
+            # ctx.run — so the sub-agent inherits them. (Copying inside the worker
+            # would capture the worker's empty context and lose them.) step_done
+            # is emitted from this thread as each settles for real-time streaming.
+            futures = {}
+            for step in phase.steps:
+                ctx = contextvars.copy_context()  # captured in THIS thread (has the callbacks)
+                future = pool.submit(ctx.run, _run_step_core, runnables[step.subagent_type], step, working, results, private_keys)
+                futures[future] = step.id
             for future in as_completed(futures):
                 step_id = futures[future]
                 try:
-                    _, text, step_delta = future.result()
+                    text, step_delta = future.result()
                 except Exception as exc:
                     logger.exception("deepflow step '%s' failed", step_id)
                     results[step_id] = f"[step '{step_id}' failed: {exc}]"
