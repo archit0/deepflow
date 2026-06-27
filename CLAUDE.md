@@ -88,13 +88,21 @@ that yield `{"messages": [...]}` — keep new tests network-free.
 
 ## Release process (always tag + release)
 
-1. Bump `__version__` in `src/deepflow/__init__.py`.
+Automated via `.github/workflows/release.yml` (PyPI **Trusted Publishing** — no
+tokens/secrets). Pushing a `vX.Y.Z` tag builds, `twine check`s, publishes to
+PyPI, and creates the GitHub release.
+
+1. Bump `__version__` in `src/deepflow/__init__.py` to match the tag.
 2. `make format && make lint && make test`.
-3. `rm -rf dist && uv build && uvx twine check dist/*`.
-4. `uvx twine upload dist/deepflow_agents-X.Y.Z*` (token in `~/.pypirc`).
-5. **Always create the git release:** `git tag vX.Y.Z` and
-   `gh release create vX.Y.Z --title "deepflow vX.Y.Z" --notes "..."` (newest gets `--latest`).
-6. Push tags: `git push origin --tags`.
+3. `git commit -am "release: X.Y.Z" && git tag vX.Y.Z && git push origin main vX.Y.Z`.
+4. The workflow does the rest. **Every published version gets a git tag + GitHub release** — this is required, never PyPI-only.
+
+One-time PyPI config: project `deepflow-agents` → Manage → Publishing → add a
+GitHub trusted publisher (owner `archit0`, repo `deepflow`, workflow
+`release.yml`, environment `pypi`).
+
+Manual fallback (if needed): `uv build && uvx twine upload dist/*` (token in
+`~/.pypirc`), then `git tag` + `gh release create`.
 
 ## Links
 
