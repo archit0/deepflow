@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deepflow"
+description = "Streaming, declarative multi-agent workflows for Deep Agents."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Archit Dwivedi" }]
+keywords = ["agents", "llm", "langchain", "deepagents", "workflow", "orchestration", "multi-agent"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dynamic = ["version"]
+dependencies = [
+  "deepagents>=0.5",
+  "pydantic>=2",
+]
+
+[project.urls]
+Homepage = "https://github.com/archit0/deepflow"
+Repository = "https://github.com/archit0/deepflow"
+Issues = "https://github.com/archit0/deepflow/issues"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+  "langchain-openai",
+]
+
+[tool.hatch.version]
+path = "src/deepflow/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deepflow"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 150
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812",  # conflicts with the formatter
+  "ISC001",  # conflicts with the formatter
+  "D203",    # one-blank-line-before-class (incompatible with D211)
+  "D213",    # multi-line-summary-second-line (incompatible with D212)
+  "PLR0913", # too many arguments
+  "ANN401",  # dynamically typed *args/**kwargs are fine at the public surface
+  "TD",      # to-do formatting
+  "FIX",     # allow TODO comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "D1", "S101", "PLR2004", "SLF001", "INP001"]
+"examples/**" = ["ANN", "D1", "T201", "S101", "S603", "BLE001", "E501", "INP001", "RUF001", "RUF002", "RUF003", "PLR2004"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

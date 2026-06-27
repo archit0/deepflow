@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+
+# Environments / tooling
+.venv/
+venv/
+.env
+.python-version
+uv.lock
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Scratch
+*.png
+.playwright-mcp/
