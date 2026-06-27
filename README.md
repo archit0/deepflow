@@ -25,12 +25,13 @@ It's built **on top of** Deep Agents (not a fork): each sub-agent is a full Deep
 ## Install
 
 ```bash
-pip install deepflow        # pulls in deepagents
+pip install deepflow-agents   # pulls in deepagents
 # or
-uv add deepflow
+uv add deepflow-agents
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+. The install name is `deepflow-agents` (the bare `deepflow`
+is taken on PyPI by an unrelated project); you still `import deepflow`.
 
 ## Quickstart
 

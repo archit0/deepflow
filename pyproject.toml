@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "deepflow"
+name = "deepflow-agents"
 description = "Streaming, declarative multi-agent workflows for Deep Agents."
 readme = "README.md"
 license = "MIT"
