@@ -39,6 +39,9 @@ class FakeAgent:
                     break
         return {"messages": [*state.get("messages", []), AIMessage(content=text)]}
 
+    def invoke(self, state, config=None):  # noqa: ARG002
+        return self._final(state)
+
     def stream(self, state, config=None, *, stream_mode=None):  # noqa: ARG002
         yield self._final(state)
 
@@ -172,9 +175,11 @@ def test_async_executes():
 
 
 def test_step_event_forwards_subagent_activity():
+    # step_event (live sub-agent activity) is forwarded on the async path, which
+    # runs in one event-loop thread where the stream writer is reachable.
     runnables = {"researcher": FakeAgent("HELLO")}
     spec = _spec([{"title": "P", "steps": [{"id": "a", "subagent_type": "researcher", "prompt": "x"}]}])
     seen, writer = _collector()
-    run_workflow(spec, runnables, _runtime(writer))
+    asyncio.run(arun_workflow(spec, runnables, _runtime(writer)))
     step_events = [e for e in seen if e["event"] == events.STEP_EVENT and e["id"] == "a"]
     assert any(e.get("kind") == "message" for e in step_events)

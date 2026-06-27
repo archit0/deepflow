@@ -7,9 +7,11 @@ Design goals:
   ``workflow_done``) is emitted the moment it happens. Crucially, ``step_done``
   fires when *that* step settles — not batched at the end of the phase — so a
   UI streaming the run sees parallel steps complete independently.
-- **Live sub-agent activity.** Each step runs the sub-agent with ``astream`` /
-  ``stream`` and forwards its new messages as ``step_event``s, so you can show
-  what a step is doing while it runs, not just that it finished.
+- **Live sub-agent activity.** On the async path each step streams its
+  sub-agent and forwards new messages as ``step_event``s, so you can show what a
+  step is doing while it runs. (The sync path emits ``step_start`` / ``step_done``
+  from the tool's own thread — where the stream writer is reachable — and skips
+  the per-message ``step_event`` firehose.)
 - **The reader matches the writer.** Results are extracted from the same final
   state the stream surfaces; the event names live in :mod:`deepflow.events`.
 """
@@ -128,33 +130,25 @@ async def arun_workflow(
 
 
 # --------------------------------------------------------------------------- #
-# Sync (events fire from worker threads via a copied context)
+# Sync
 # --------------------------------------------------------------------------- #
-def _run_step(
+def _run_step_core(
     runnable: Runnable,
     step: WorkflowStep,
     base_state: Mapping[str, Any],
     results: dict[str, str],
     private_keys: frozenset[str],
-    emit: _Emitter,
-) -> tuple[str, str, dict[str, Any]]:
-    emit(events.STEP_START, id=step.id, subagent=step.subagent_type)
+) -> tuple[str, dict[str, Any]]:
+    """Run one step in a worker thread without emitting.
+
+    A LangGraph stream writer only reaches the stream from the tool's own
+    thread, so the sync executor emits ``step_start`` / ``step_done`` from the
+    main thread instead (``step_done`` still fires as each step settles). The
+    richer ``step_event`` stream is available on the async path.
+    """
     state = prepare_state(base_state, render_prompt(step.prompt, results), private_keys=private_keys)
-    last: Mapping[str, Any] | None = None
-    seen = 0
-    try:
-        for chunk in runnable.stream(state, _SUBAGENT_CONFIG, stream_mode="values"):
-            last = chunk if isinstance(chunk, dict) else None
-            msgs = last.get("messages", []) if last else []
-            for msg in msgs[seen:]:
-                emit(events.STEP_EVENT, id=step.id, **_summarize_message(msg))
-            seen = len(msgs)
-    except Exception as exc:
-        logger.exception("deepflow step '%s' failed", step.id)
-        emit(events.STEP_ERROR, id=step.id, error=str(exc))
-        return step.id, f"[step '{step.id}' failed: {exc}]", {}
-    emit(events.STEP_DONE, id=step.id)
-    return step.id, extract_text(last), state_delta(last)
+    result = runnable.invoke(state, _SUBAGENT_CONFIG)
+    return extract_text(result), state_delta(result)
 
 
 def run_workflow(
@@ -173,18 +167,29 @@ def run_workflow(
     delta: dict[str, Any] = {}
     for index, phase in enumerate(spec.phases):
         emit(events.PHASE_START, index=index, title=phase.title)
+        for step in phase.steps:
+            emit(events.STEP_START, id=step.id, subagent=step.subagent_type)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             # Run each step in a copy of the current context so worker threads
-            # inherit the stream writer, callbacks, and tracing; collect results
-            # as each settles (events already fired in real time inside the step).
+            # inherit callbacks and tracing; emit step_done from this (the tool's)
+            # thread as each settles, so events reach the stream in real time.
             def _go(step: WorkflowStep) -> tuple[str, str, dict[str, Any]]:
-                return contextvars.copy_context().run(_run_step, runnables[step.subagent_type], step, working, results, private_keys, emit)
+                text, step_delta = contextvars.copy_context().run(_run_step_core, runnables[step.subagent_type], step, working, results, private_keys)
+                return step.id, text, step_delta
 
-            futures = [pool.submit(_go, s) for s in phase.steps]
+            futures = {pool.submit(_go, s): s.id for s in phase.steps}
             for future in as_completed(futures):
-                sid, text, step_delta = future.result()
-                results[sid] = text
+                step_id = futures[future]
+                try:
+                    _, text, step_delta = future.result()
+                except Exception as exc:
+                    logger.exception("deepflow step '%s' failed", step_id)
+                    results[step_id] = f"[step '{step_id}' failed: {exc}]"
+                    emit(events.STEP_ERROR, id=step_id, error=str(exc))
+                    continue
+                results[step_id] = text
                 merge_delta(delta, step_delta)
+                emit(events.STEP_DONE, id=step_id)
         merge_delta(working, delta)
         emit(events.PHASE_DONE, index=index, title=phase.title)
     emit(events.WORKFLOW_DONE)
