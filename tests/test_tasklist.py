@@ -141,7 +141,7 @@ def _tools() -> dict:
 
 def test_read_todos_paginates_and_filters() -> None:
     read = _tools()["read_todos"]
-    state = {"todos": _todos(5)}
+    state = {"tasks": _todos(5)}
     page = json.loads(read.func(runtime=_rt(state), status="pending", limit=2, offset=0))
     assert page["total"] == 5
     assert page["returned"] == 2
@@ -153,11 +153,11 @@ def test_read_todos_paginates_and_filters() -> None:
 
 def test_write_todos_updates_status_and_result() -> None:
     write = _tools()["write_todos"]
-    state = {"todos": _todos(3)}
+    state = {"tasks": _todos(3)}
     cmd = write.func(id="td0001", status="done", runtime=_rt(state), result="ok")
     assert isinstance(cmd, Command)
-    assert cmd.update["todos"]["td0001"]["status"] == "done"
-    assert cmd.update["todos"]["td0001"]["result"] == "ok"
+    assert cmd.update["tasks"]["td0001"]["status"] == "done"
+    assert cmd.update["tasks"]["td0001"]["result"] == "ok"
 
     miss = write.func(id="nope", status="done", runtime=_rt(state))
     assert isinstance(miss, str)
@@ -168,10 +168,10 @@ def test_add_and_count_todos() -> None:
     tools = _tools()
     cmd = tools["add_todos"].func(items=["a", "b", "c"], runtime=_rt({}))
     assert isinstance(cmd, Command)
-    assert len(cmd.update["todos"]) == 3
-    assert all(t["status"] == "pending" for t in cmd.update["todos"].values())
+    assert len(cmd.update["tasks"]) == 3
+    assert all(t["status"] == "pending" for t in cmd.update["tasks"].values())
 
-    counts = json.loads(tools["count_todos"].func(runtime=_rt({"todos": _todos(4)})))
+    counts = json.loads(tools["count_todos"].func(runtime=_rt({"tasks": _todos(4)})))
     assert counts["total"] == 4
     assert counts["by_status"] == {"pending": 4}
 
@@ -190,8 +190,9 @@ def test_make_todos_and_merge_reducer() -> None:
 
 
 def test_merge_is_defensive_against_non_dict() -> None:
-    # A co-mounted planning write_todos may write a list; the reducer must not crash.
-    assert _merge({"1": {"id": "1", "content": "", "status": "done"}}, ["a", "b"]) == ["a", "b"]
+    # A non-dict write must NEVER clobber the store — the existing dict is kept.
+    store = {"1": {"id": "1", "content": "", "status": "done"}}
+    assert _merge(store, ["a", "b"]) == store  # list write ignored, store preserved
     assert _merge(["x"], {"1": {"id": "1", "content": "", "status": "pending"}}) == {"1": {"id": "1", "content": "", "status": "pending"}}
     assert _merge(None, None) == {}
 
@@ -221,8 +222,10 @@ def test_workflow_agent_can_enable_todos() -> None:
     agent = create_workflow_agent(model=_build_model(), enable_todos=True)
     names = _tool_names(agent)
     assert {"workflow", "process_todos", "count_todos", "add_todos"} <= names
-    # our merge reducer must win the shared `todos` channel
-    assert type(agent.channels["todos"]).__name__ == "BinaryOperatorAggregate"
+    # the task store lives on its OWN `tasks` channel (merge reducer), separate from
+    # deepagents' planning `todos` channel — so they never collide.
+    assert type(agent.channels["tasks"]).__name__ == "BinaryOperatorAggregate"
+    assert "todos" in agent.channels  # deepagents' planning todos still present, independently
 
 
 def test_aggregate_counts_by_status() -> None:

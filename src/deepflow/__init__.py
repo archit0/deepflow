@@ -43,7 +43,7 @@ from deepflow.tasklist import (
     worker_tool_names,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "CompiledSubAgent",

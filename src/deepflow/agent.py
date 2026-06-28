@@ -147,7 +147,7 @@ def create_tasklist_agent(
     """Create an agent with **task-list mode** — scalable dispatch over many to-dos.
 
     The agent gets `count_todos` / `add_todos` / `process_todos`. Seed the store
-    with ``todos`` at invoke time (``deepflow.make_todos([...])``), or let the
+    with ``tasks`` at invoke time (``deepflow.make_todos([...])``), or let the
     agent populate it via ``add_todos``. ``process_todos`` fans the pending to-dos
     out to worker sub-agents in disjoint batches; each worker sees only its slice.
 

@@ -41,18 +41,54 @@ Requires Python 3.11+. The install name is `deepflow-agents` (the bare `deepflow
 
 ---
 
+## Quickstart
+
+Give the agent one objective; it authors a **DAG of sub-agents** and runs it. Stream the run to watch the plan and every step as they happen:
+
+```python
+from deepflow import create_workflow_agent
+
+agent = create_workflow_agent("openai:gpt-5.5")
+
+for mode, chunk in agent.stream(
+    {"messages": "Research PostgreSQL, SQLite and DuckDB in parallel, then recommend one for a local analytics CLI."},
+    stream_mode=["updates", "custom"],
+):
+    if mode == "custom" and "deepflow" in chunk:
+        ev = chunk["deepflow"]
+        print(ev["event"], {k: v for k, v in ev.items() if k != "event"})
+```
+
+```text
+plan           {'phase_count': 2, 'step_count': 4}
+phase_start    {'index': 0, 'title': 'Research'}
+step_start     {'id': 'postgres', 'subagent': 'general-purpose'}   ┐
+step_start     {'id': 'sqlite',   'subagent': 'general-purpose'}   │ run in parallel
+step_start     {'id': 'duckdb',   'subagent': 'general-purpose'}   ┘
+step_done      {'id': 'duckdb'}  …
+phase_start    {'index': 1, 'title': 'Recommend'}
+step_done      {'id': 'recommendation'}      # ⇐ depends on all three (fan-in)
+workflow_done  {}
+```
+
+The two ways to use it follow — **workflows**, and a **workflow that also drives a large task list**. Runnable versions live in [`examples/`](examples/).
+
+---
+
 ## Use cases
 
-### 1 · Workflow mode
+### 1 · Creating workflows
 
-The agent decides *when* to use a workflow — it stays a normal agent and only authors one for multi-stage or fan-out/fan-in work.
+The agent authors a phase/step plan in a single call. It decides *when* — it stays a normal agent and only reaches for a workflow when work fans out into parallel parts that then combine.
 
 ```python
 from deepflow import create_workflow_agent
 
 agent = create_workflow_agent(model="openai:gpt-5.5")
 
-result = agent.invoke({"messages": "Research Postgres and SQLite, then recommend one for a CLI app."})
+result = agent.invoke({"messages":
+    "Compare PostgreSQL, SQLite and DuckDB for a local analytics CLI — research each in parallel, then recommend one."
+})
 print(result["messages"][-1].content)
 ```
 
@@ -75,50 +111,30 @@ A workflow is an ordered list of **phases**; each phase has **steps**. Phases ru
 
 Invalid plans come back to the model as actionable messages (*"Step 's' references {{a}} but does not list it in depends_on"*), not opaque tool errors.
 
-### 2 · Task-list mode — *with* a defined to-do list
+### 2 · A workflow with a task list
 
-You already have the work. Seed it with `make_todos(...)`; the agent checks the **count** (not the contents), then calls `process_todos`, which fans the pending to-dos out to workers in disjoint batches. Each worker drains only its slice and writes status per to-do.
+A workflow can also drive a **large, long-running task list**. One flag — `enable_todos=True` — gives the agent `count_todos` / `add_todos` / `process_todos` alongside `workflow`. Hand it a **specified** list of tasks, or let it **create its own internal tasks** with `add_todos`, and it works through them at scale:
 
 ```python
-from deepflow import create_tasklist_agent, make_todos
+from deepflow import create_workflow_agent, make_todos
 
-agent = create_tasklist_agent(model="openai:gpt-5.5", batch_size=50)
+agent = create_workflow_agent(model="openai:gpt-5.5", enable_todos=True, todo_batch_size=50)
 
-todos = make_todos([f"Summarize {name} in one line." for name in services])  # could be 5,000
+# a specified task list (could be 5,000) — or let the agent build it with add_todos
 result = agent.invoke({
-    "messages": "Process every pending to-do — each worker reads its to-dos and writes a one-line summary.",
-    "todos": todos,
+    "messages": "Work through every pending to-do; each worker writes a one-line result.",
+    "tasks": make_todos(tasks),
 })
 # the orchestrator only ever sees: "done=5000" — never the 5,000 items
 ```
 
-**Why it scales:** orchestrator context is `O(log N)` (a status rollup), each worker is `O(batch)`, and the store lives in state — never in a prompt. 10× the to-dos adds **one digit** to what the orchestrator sees, not 10× the tokens.
+**Task management** — the to-dos live in a store with status; `process_todos` partitions the pending ones into **disjoint batches**, runs them in parallel, and you re-run it to retry anything still pending/failed.
 
-### 3 · Task-list mode — *without* a list (the agent builds it)
+**Context management** — the orchestrator plans from **counts, never contents** (`O(log N)` — 10× the to-dos adds one digit, not 10× the tokens); each worker is handed only its batch (`O(batch)`); the store lives in state and never enters a prompt. That's what lets a single workflow drive thousands of tasks across a long-running job without its context exploding.
 
-Give an **objective** instead of a list. The agent breaks it into to-dos itself with `add_todos`, then dispatches them the same way.
+> **Workers are Deep Agents minus orchestration.** Every worker has the full Deep Agent toolset — filesystem, `execute`, summarization/compaction — **but no `task` and no `workflow`**: it drains its assigned slice and nothing more. Disjoint batches ⇒ no race, no double-processing.
 
-```python
-from deepflow import create_tasklist_agent
-
-agent = create_tasklist_agent(model="openai:gpt-5.5", batch_size=3)
-
-agent.invoke({"messages":
-    "Harden our web app before launch. First use add_todos to create ~8 concrete security "
-    "checks, then call process_todos so each worker performs its check and writes a one-line result."
-})
-```
-
-### Combine both — the `enable_todos` flag
-
-A workflow agent can *also* dispatch a to-do store. Flip one flag and it gains `count_todos` / `add_todos` / `process_todos` alongside `workflow`:
-
-```python
-agent = create_workflow_agent(model="openai:gpt-5.5", enable_todos=True)
-# tools now include: workflow, process_todos, count_todos, add_todos
-```
-
-> **Workers are Deep Agents minus orchestration.** In task-list mode every worker has the full Deep Agent toolset — filesystem, `execute`, summarization/compaction — **but no `task` and no `workflow`**: it drains its assigned slice and nothing more. Batches are disjoint, so there's no race and no double-processing.
+*Prefer a dedicated task-list agent without the `workflow` tool? `create_tasklist_agent(model, batch_size=...)` is the same store and dispatch on its own.*
 
 ---
 
@@ -128,7 +144,7 @@ Stream the run and render events as they happen — same for `agent.stream(...)`
 
 ```python
 for mode, chunk in agent.stream(
-    {"messages": "...", "todos": todos},
+    {"messages": "...", "tasks": tasks},
     stream_mode=["updates", "custom"],
 ):
     if mode == "custom" and "deepflow" in chunk:
@@ -210,13 +226,14 @@ create_deep_agent(model="openai:gpt-5.5", middleware=[TaskListMiddleware(model="
 
 | file | shows |
 |---|---|
-| [`examples/build_library_demo.py`](examples/build_library_demo.py) | a workflow builds a small Python library in a real shell — plain Deep Agent vs. workflow, tokens/turns compared, every event streamed |
+| [`examples/workflow_demo.py`](examples/workflow_demo.py) | **1 · creating workflows** — three databases researched in parallel, then a synthesis step fans in; the plan + every step streamed live |
+| [`examples/workflow_with_tasks_demo.py`](examples/workflow_with_tasks_demo.py) | **2 · a workflow with a task list** — `enable_todos=True`, a specified list dispatched in disjoint batches with a per-worker visual of each slice, its `read_todos`, and its results |
+| [`examples/build_library_demo.py`](examples/build_library_demo.py) | a workflow builds a small Python library in a real shell — plain Deep Agent vs. workflow, tokens/turns compared |
 | [`examples/explore_then_workflow_demo.py`](examples/explore_then_workflow_demo.py) | the agent does ordinary tool calls first, *then* authors a workflow once it knows what to fan out over |
-| [`examples/tasklist_seeded_demo.py`](examples/tasklist_seeded_demo.py) | task-list mode with a **defined** list — a per-worker visual of each slice, its `read_todos`, and its results |
-| [`examples/tasklist_generated_demo.py`](examples/tasklist_generated_demo.py) | task-list mode where the agent **builds** the list itself via `add_todos`, then dispatches it |
 
 ```bash
-OPENAI_API_KEY=… uv run python examples/tasklist_seeded_demo.py
+OPENAI_API_KEY=… uv run python examples/workflow_demo.py
+OPENAI_API_KEY=… uv run python examples/workflow_with_tasks_demo.py
 ```
 
 ## How it relates to Deep Agents

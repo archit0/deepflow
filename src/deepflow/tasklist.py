@@ -64,37 +64,43 @@ class Todo(TypedDict):
     result: NotRequired[str]
 
 
-def _merge(old: dict[str, Todo] | None, new: Any) -> Any:
+def _merge(old: dict[str, Todo] | None, new: Any) -> dict[str, Todo]:
     """Reducer: union by id (append + update, never delete). Concurrency-safe.
 
-    Defensive: if ``new`` is not a dict (e.g. a co-mounted planning ``write_todos``
-    that writes a list when task-list mode is enabled alongside it), fall back to
-    replace rather than crash the channel.
+    Defensive: a non-dict write never clobbers the store — the existing dict is
+    kept. (The store lives on its own ``tasks`` channel, so this is belt-and-braces.)
     """
     if not isinstance(new, dict):
-        return new if new is not None else (old or {})
+        return old if isinstance(old, dict) else {}
     base = old if isinstance(old, dict) else {}
     return {**base, **new}
 
 
 class TaskListState(AgentState):
-    """Agent state extended with the shared to-do store."""
+    """Agent state extended with the shared task store.
 
-    todos: Annotated[NotRequired[dict[str, Todo]], _merge]
+    The store lives on its own ``tasks`` channel (NOT ``todos``) so it never
+    aliases the planning ``todos`` channel that ``deepagents`` mounts — both can
+    coexist on one agent (e.g. ``create_workflow_agent(enable_todos=True)``).
+    """
+
+    tasks: Annotated[NotRequired[dict[str, Todo]], _merge]
 
 
-def aggregate(todos: dict[str, Todo]) -> dict[str, int]:
+def aggregate(todos: Any) -> dict[str, int]:
     """Status rollup: counts by status. This is all the orchestrator ever sees."""
     counts: dict[str, int] = {}
+    if not isinstance(todos, dict):
+        return counts
     for todo in todos.values():
         counts[todo["status"]] = counts.get(todo["status"], 0) + 1
     return counts
 
 
 def make_todos(items: Sequence[str]) -> dict[str, Todo]:
-    """Build an initial to-do store from a list of contents (each starts pending).
+    """Build an initial task store from a list of contents (each starts pending).
 
-    Convenience for seeding a run: ``agent.invoke({"messages": ..., "todos":
+    Convenience for seeding a run: ``agent.invoke({"messages": ..., "tasks":
     make_todos([...])})``.
     """
     store: dict[str, Todo] = {}
@@ -159,7 +165,9 @@ def dispatch(
     to-dos (safe to merge back into the store).
     """
     emit = emit or _Emitter(None)
-    pending = [(tid, todo) for tid, todo in todos.items() if todo["status"] in statuses]
+    # Reset matched to-dos to `pending` in the worker's batch view, so a retry
+    # (statuses includes "failed") is drained even if a worker filters on pending.
+    pending = [(tid, {**todo, "status": "pending"}) for tid, todo in todos.items() if todo["status"] in statuses]
     batches = _batches(pending, batch_size)
     emit(events.TASKLIST_PLAN, total=len(todos), pending=len(pending), batch_size=batch_size, worker_count=len(batches))
 
@@ -217,25 +225,25 @@ def store_tools() -> list[BaseTool]:
 
     def add_todos(items: list[str], runtime: ToolRuntime) -> Command:
         new = make_todos(items)
-        return Command(update={"todos": new, "messages": [ToolMessage(f"Added {len(new)} to-dos.", tool_call_id=runtime.tool_call_id)]})
+        return Command(update={"tasks": new, "messages": [ToolMessage(f"Added {len(new)} to-dos.", tool_call_id=runtime.tool_call_id)]})
 
     def read_todos(runtime: ToolRuntime, status: str | None = None, limit: int = 20, offset: int = 0) -> str:
-        todos = runtime.state.get("todos") or {}
+        todos = runtime.state.get("tasks") or {}
         items = [t for t in todos.values() if status is None or t["status"] == status]
         page = items[offset : offset + limit]
         return json.dumps({"total": len(items), "offset": offset, "returned": len(page), "todos": page})
 
     def write_todos(id: str, status: Status, runtime: ToolRuntime, result: str | None = None) -> Command | str:  # noqa: A002 - tool arg name is model-facing
-        todos = runtime.state.get("todos") or {}
+        todos = runtime.state.get("tasks") or {}
         if id not in todos:
             return f"Unknown to-do '{id}'."
         updated: Todo = {**todos[id], "status": status}
         if result is not None:
             updated["result"] = result
-        return Command(update={"todos": {id: updated}, "messages": [ToolMessage(f"{id} -> {status}", tool_call_id=runtime.tool_call_id)]})
+        return Command(update={"tasks": {id: updated}, "messages": [ToolMessage(f"{id} -> {status}", tool_call_id=runtime.tool_call_id)]})
 
     def count_todos(runtime: ToolRuntime) -> str:
-        todos = runtime.state.get("todos") or {}
+        todos = runtime.state.get("tasks") or {}
         return json.dumps({"total": len(todos), "by_status": aggregate(todos)})
 
     add_desc = "Append new to-dos (each starts pending)."
@@ -252,9 +260,10 @@ def store_tools() -> list[BaseTool]:
 
 WORKER_PROMPT = (
     "You are a focused worker. You have been handed a small batch of to-dos — ONLY yours, nobody else's.\n"
-    "Loop: call `read_todos(status='pending')` to see your batch, do each task with your tools, then call "
-    "`write_todos(id, 'done', <short result>)` (or `'failed'` with the reason). When `read_todos(status='pending')` "
-    "is empty you are finished — stop. You cannot create sub-agents or workflows; just drain your batch."
+    "Call `read_todos()` (no filter) to see EVERY to-do in your batch, do each one with your tools, then call "
+    "`write_todos(id, 'done', <short result>)` for it (or `'failed'` with the reason). Cover every to-do you were "
+    "given — including any that come back as `failed` on a retry — then stop. You cannot create sub-agents or "
+    "workflows; just drain your batch."
 )
 
 ORCHESTRATOR_PROMPT = """## Task-list mode
@@ -378,11 +387,12 @@ def agent_worker_fn(worker: Any, instruction: str) -> WorkerFn:
 
     def fn(worker_id: str, batch: dict[str, Todo]) -> WorkerResult:  # noqa: ARG001 - id is used by the caller for events
         prompt = (
-            f"{instruction}\n\nYou have {len(batch)} assigned to-dos. Read them with `read_todos`, complete each, "
-            "and `write_todos(id, 'done'|'failed', result)` for every one. Stop when none are pending."
+            f"{instruction}\n\nYou have {len(batch)} assigned to-dos. Read ALL of them with `read_todos()` (no filter), "
+            "complete each, and `write_todos(id, 'done'|'failed', result)` for every one. Cover every to-do — including "
+            "any already marked `failed` (a retry) — then stop."
         )
-        result = worker.invoke({"messages": [HumanMessage(content=prompt)], "todos": dict(batch)})
-        updated = result.get("todos") or dict(batch)
+        result = worker.invoke({"messages": [HumanMessage(content=prompt)], "tasks": dict(batch)})
+        updated = result.get("tasks") or dict(batch)
         reads: list[ReadEvent] = []
         for msg in result.get("messages", []):
             if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "read_todos":
@@ -452,14 +462,14 @@ class TaskListMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
     def _process_tool(self) -> BaseTool:
         def process_todos(instruction: str, runtime: ToolRuntime, batch_size: int | None = None, max_workers: int | None = None) -> Command:
             emit = _Emitter(getattr(runtime, "stream_writer", None))
-            todos = runtime.state.get("todos") or {}
+            todos = runtime.state.get("tasks") or {}
             size = batch_size or self._batch_size
             workers = max_workers or self._max_workers
             pending = sum(1 for t in todos.values() if t["status"] in ("pending", "failed"))
             worker_fn = agent_worker_fn(self._worker_factory(), instruction)
             delta, rollup, batches = dispatch(todos, worker_fn, batch_size=size, concurrency=workers, statuses=("pending", "failed"), emit=emit)
             summary = f"Dispatched {pending} to-dos across {batches} workers (batch<={size}). Status now: {json.dumps(rollup)}"
-            return Command(update={"todos": delta, "messages": [ToolMessage(summary, tool_call_id=runtime.tool_call_id)]})
+            return Command(update={"tasks": delta, "messages": [ToolMessage(summary, tool_call_id=runtime.tool_call_id)]})
 
         return StructuredTool.from_function(
             func=process_todos,

@@ -12,11 +12,12 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-EXCLUDED_STATE_KEYS = frozenset({"messages", "todos", "structured_response"})
-"""Keys not forwarded into a sub-agent (and not merged back).
+EXCLUDED_STATE_KEYS = frozenset({"messages", "todos", "tasks", "structured_response"})
+"""Keys not forwarded into a workflow sub-agent (and not merged back).
 
-``messages`` is replaced with the step's prompt; ``todos`` /
-``structured_response`` have no cross-agent reducer.
+``messages`` is replaced with the step's prompt; ``todos`` (planning),
+``tasks`` (the task-list store) and ``structured_response`` are agent-local and
+must not leak across steps.
 """
 
 
