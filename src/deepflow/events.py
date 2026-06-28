@@ -38,3 +38,29 @@ STEP_ERROR = "step_error"
 
 WORKFLOW_DONE = "workflow_done"
 """The whole workflow finished; the final result is on its way back."""
+
+
+# --------------------------------------------------------------------------- #
+# Task-list mode (scalable to-do dispatch). Same NAMESPACE; distinct event
+# names, so one reader can render both a workflow and a task-list run.
+# --------------------------------------------------------------------------- #
+TASKLIST_PLAN = "tasklist_plan"
+"""Emitted once before dispatch. Fields: ``total``, ``pending``, ``batch_size``,
+``worker_count`` — the orchestrator's plan, derived from counts (never contents)."""
+
+BATCH_START = "batch_start"
+"""A worker has been handed its slice. Fields: ``worker``, ``size``, ``todos``
+(``[{id, content}]``) — the ENTIRE visible context of that worker, i.e. exactly
+what its ``read_todos`` can return. No worker ever sees more than this."""
+
+WORKER_READ = "worker_read"
+"""A running worker called ``read_todos``. Fields: ``worker``, ``returned``,
+``ids`` — proof it sees only its own slice, not the global store."""
+
+BATCH_DONE = "batch_done"
+"""A worker finished its slice. Fields: ``worker``, ``results``
+(``[{id, status, result}]``) — the status it wrote for each of its to-dos."""
+
+TASKLIST_DONE = "tasklist_done"
+"""Dispatch finished. Fields: ``done``, ``failed``, ``pending``, ``in_progress``
+— the final status rollup the orchestrator receives (its whole footprint)."""

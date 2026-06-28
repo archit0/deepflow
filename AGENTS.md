@@ -6,11 +6,17 @@ and `CLAUDE.md` are kept identical.
 ## What this is
 
 **deepflow** is a small, focused package that adds **streaming, declarative
-multi-agent workflows** to [Deep Agents](https://github.com/langchain-ai/deepagents).
-An agent gets one `workflow` tool: it authors a phase/step plan in a single call,
-independent steps fan out in parallel, later steps consume earlier results via
-`{{step_id}}` templating, each step runs in its own isolated sub-agent, and the
-whole run streams live.
+multi-agent orchestration** to [Deep Agents](https://github.com/langchain-ai/deepagents).
+Two modes, one idea — keep the orchestrator's context tiny while sub-agents do
+the work, and stream it live:
+
+- **Workflow mode** (`workflow` tool): the agent authors a phase/step plan in a
+  single call; steps fan out in parallel, later steps consume earlier results via
+  `{{step_id}}` templating, each step runs in its own isolated sub-agent.
+- **Task-list mode** (`process_todos` tool): a job that explodes into hundreds or
+  thousands of to-dos is dispatched to workers in **disjoint batches** — each
+  worker sees only its slice, the store never enters a prompt, the orchestrator
+  sees only a status rollup.
 
 - **PyPI name:** `deepflow-agents` (bare `deepflow` is owned by an unrelated
   project). **Import name:** `deepflow`. So `pip install deepflow-agents` →
@@ -28,18 +34,22 @@ src/deepflow/
   spec.py         # Pydantic models, validation, {{}} templating, plan payload
   events.py       # the event-name schema emitted on the custom stream
   _subagent.py    # decoupled helpers: state prep, result extraction, delta merge
-  engine.py       # streaming executor (sync + async)
+  engine.py       # streaming executor (sync + async) — workflow mode
   middleware.py   # WorkflowMiddleware + the `workflow` tool + prompts
-  agent.py        # create_workflow_agent (batteries-included wrapper)
+  tasklist.py     # task-list mode: store, paginated tools, dispatcher, workers, TaskListMiddleware
+  agent.py        # create_workflow_agent / create_tasklist_agent (batteries-included wrappers)
   py.typed
-tests/test_workflow.py   # network-free unit tests (fake sub-agents)
+tests/test_workflow.py   # network-free unit tests for workflow mode
+tests/test_tasklist.py   # network-free unit tests for task-list mode
 examples/                # runnable demos (need OPENAI_* env)
 ```
 
 ## Public API (`from deepflow import ...`)
 
-- `create_workflow_agent(model, *, subagents=None, tools=None, backend=None, system_prompt=None, workflow_model=None, max_concurrency=None, max_steps=25, **kwargs)` — the main entry point.
-- `WorkflowMiddleware` — the `AgentMiddleware` that injects the `workflow` tool; drop into any `create_deep_agent(middleware=[...])`.
+- `create_workflow_agent(model, *, subagents=None, tools=None, backend=None, system_prompt=None, workflow_model=None, max_concurrency=None, max_steps=25, enable_todos=False, todo_batch_size=50, todo_max_workers=8, **kwargs)` — workflow mode (with optional `enable_todos` to also mount task-list mode).
+- `create_tasklist_agent(model, *, tools=None, backend=None, system_prompt=None, worker_model=None, worker_system_prompt=…, batch_size=50, max_workers=8, **kwargs)` — task-list mode. Seed `todos` at invoke via `make_todos([...])`, or let the agent build them with `add_todos`.
+- `WorkflowMiddleware` — injects the `workflow` tool; `TaskListMiddleware` — injects `count_todos`/`add_todos`/`process_todos`. Both drop into any `create_deep_agent(middleware=[...])`.
+- `make_todos`, `dispatch`, `aggregate`, `make_worker`, `worker_tool_names`, `Todo`, `TaskListState`, `TodoStoreMiddleware`.
 - `WorkflowSpec`, `WorkflowPhase`, `WorkflowStep`, `WorkflowToolArgs`, `validate_workflow`, `render_prompt`, `plan_payload`, `CompiledSubAgent`, `WorkflowSubAgent`, `events`.
 
 ## Architecture & key behaviours
@@ -47,6 +57,14 @@ examples/                # runnable demos (need OPENAI_* env)
 - **The workflow the model authors:** `phases: [{title, steps: [{id, subagent_type, description, prompt, depends_on}]}]`. Phases run **sequentially**; steps within a phase run **concurrently** (fan-out); a later step consumes an earlier one via `{{step_id}}` (fan-in). Validation (`validate_workflow`) rejects unknown sub-agents, forward/same-phase deps, undeclared `{{}}` refs, duplicate ids, and over-`max_steps` — returning an **actionable message to the model**, not an opaque tool error (the tool advertises a loose `list[Any]` arg schema so the engine, not the schema boundary, reports the error).
 - **Sub-agent tools:** a workflow worker gets **everything the orchestrator has except the `workflow` tool** — the full Deep Agents suite (`write_todos`, filesystem tools, `execute`), the same `backend`, any `tools=` you pass, and its own `task` tool (it's a full Deep Agent). The `WorkflowMiddleware` is attached only to the orchestrator, which prevents nested workflows.
 - **Streaming-first (`deepflow.events`):** the engine emits `plan` → `phase_start` → `step_start` → `step_event` → `step_done` → `phase_done` → `workflow_done` on the LangGraph **custom** stream as `{"deepflow": {...}}`. Consume with `agent.stream(..., stream_mode=["updates", "custom"])`. `step_done` fires the moment a step settles (not batched at phase end). The **async** path forwards live per-message `step_event`s from inside each running sub-agent; the **sync** path emits `step_start`/`step_done` from the tool's own thread and skips the per-message firehose.
+
+### Task-list mode (`tasklist.py`)
+
+- **The store:** a `todos` state channel (`{id: {content, status, result}}`) with a **merge reducer** (`_merge`, union by id) so concurrent worker writes never clobber. It is **never injected into a prompt** — agents touch it only via paginated/filtered tools. `_merge` is defensive: a non-dict write (e.g. a co-mounted planning `write_todos` list) falls back to replace instead of crashing the channel.
+- **Tools:** workers get `read_todos` (paginated page, never the whole store) / `write_todos` / `add_todos` / `count_todos`; the orchestrator (`TaskListMiddleware`) gets `count_todos` / `add_todos` / `process_todos` only — **not** `write_todos` (so it can't be confused with deepagents' planning `write_todos`).
+- **The dispatcher (`dispatch`)** partitions pending to-dos into disjoint batches and runs them in a `ThreadPoolExecutor`, capturing `copy_context()` in the tool thread (same lesson as the workflow engine) so tracing/streaming propagate. Returns `(delta, rollup, batch_count)`. It emits `tasklist_plan` → `batch_start` → `worker_read` → `batch_done` → `tasklist_done`.
+- **Workers** are built with langchain `create_agent` + `FilesystemMiddleware` + `SummarizationMiddleware` + `TodoStoreMiddleware` — **deliberately not `create_deep_agent`**, so they get filesystem/`execute`/compaction but **no `task` and no `workflow`** (verify with `worker_tool_names`), and so the built-in list-typed `write_todos` never collides with our dict store.
+- **`enable_todos` on `create_workflow_agent`** appends `TaskListMiddleware`; our `_merge` wins the shared `todos` channel (`BinaryOperatorAggregate`), so the store stays correct even alongside deepagents' planning todos.
 
 ## Gotchas (these have bitten us — keep them in mind)
 

@@ -20,7 +20,7 @@ Built on top of Deep Agents (https://github.com/langchain-ai/deepagents).
 """
 
 from deepflow import events
-from deepflow.agent import WorkflowSubAgent, create_workflow_agent
+from deepflow.agent import WorkflowSubAgent, create_tasklist_agent, create_workflow_agent
 from deepflow.middleware import CompiledSubAgent, WorkflowMiddleware, build_workflow_tool
 from deepflow.spec import (
     WorkflowPhase,
@@ -31,11 +31,26 @@ from deepflow.spec import (
     render_prompt,
     validate_workflow,
 )
+from deepflow.tasklist import (
+    TaskListMiddleware,
+    TaskListState,
+    Todo,
+    TodoStoreMiddleware,
+    aggregate,
+    dispatch,
+    make_todos,
+    make_worker,
+    worker_tool_names,
+)
 
-__version__ = "0.1.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "CompiledSubAgent",
+    "TaskListMiddleware",
+    "TaskListState",
+    "Todo",
+    "TodoStoreMiddleware",
     "WorkflowMiddleware",
     "WorkflowPhase",
     "WorkflowSpec",
@@ -43,10 +58,16 @@ __all__ = [
     "WorkflowSubAgent",
     "WorkflowToolArgs",
     "__version__",
+    "aggregate",
     "build_workflow_tool",
+    "create_tasklist_agent",
     "create_workflow_agent",
+    "dispatch",
     "events",
+    "make_todos",
+    "make_worker",
     "plan_payload",
     "render_prompt",
     "validate_workflow",
+    "worker_tool_names",
 ]
