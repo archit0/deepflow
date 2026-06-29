@@ -11,14 +11,16 @@ from langgraph.types import Command
 
 from deepflow import events
 from deepflow.tasklist import (
-    _Emitter as Emitter,
-)
-from deepflow.tasklist import (
+    _batches,
     _merge,
     aggregate,
     dispatch,
     make_todos,
     store_tools,
+    verify,
+)
+from deepflow.tasklist import (
+    _Emitter as Emitter,
 )
 
 
@@ -226,6 +228,107 @@ def test_workflow_agent_can_enable_todos() -> None:
     # deepagents' planning `todos` channel — so they never collide.
     assert type(agent.channels["tasks"]).__name__ == "BinaryOperatorAggregate"
     assert "todos" in agent.channels  # deepagents' planning todos still present, independently
+
+
+# --- acceptance checks (deterministic verification) -------------------------
+def test_make_todos_accepts_specs() -> None:
+    store = make_todos(["plain", {"content": "x", "check": "pytest -q", "group": "g"}])
+    todos = list(store.values())
+    plain = next(t for t in todos if t["content"] == "plain")
+    rich = next(t for t in todos if t["content"] == "x")
+    assert "check" not in plain
+    assert "group" not in plain
+    assert rich["check"] == "pytest -q"
+    assert rich["group"] == "g"
+
+
+def test_dispatch_verifies_checks_and_flips_failures() -> None:
+    todos = make_todos([{"content": "a", "check": "c1"}, {"content": "b", "check": "c2"}, "c"])
+
+    def runner(cmd: str) -> tuple[bool, str]:
+        # c1 passes, c2 fails; the engine — not the model — decides "done".
+        return (cmd == "c1", "" if cmd == "c1" else "boom")
+
+    delta, agg, _ = dispatch(todos, _drain_worker([]), batch_size=10, check_runner=runner)
+    status = {t["content"]: t["status"] for t in delta.values()}
+    assert status["a"] == "done"  # check passed
+    assert status["b"] == "failed"  # check failed -> flipped despite the worker saying done
+    assert status["c"] == "done"  # no check -> trusted
+    assert agg.get("failed") == 1
+    flipped = next(t for t in delta.values() if t["content"] == "b")
+    assert flipped["result"].startswith("check failed")
+
+
+def test_check_failure_emits_event() -> None:
+    todos = make_todos([{"content": "a", "check": "x"}])
+    seen, emit = _collector()
+    dispatch(todos, _drain_worker([]), batch_size=5, check_runner=lambda _c: (False, "nope"), emit=emit)
+    names = [e["event"] for e in seen]
+    assert events.CHECK_FAILED in names
+    ev = next(e for e in seen if e["event"] == events.CHECK_FAILED)
+    assert ev["output"] == "nope"
+
+
+# --- group co-location ------------------------------------------------------
+def test_batches_colocate_same_group() -> None:
+    todos = make_todos([
+        {"content": "a", "group": "g1"},
+        {"content": "b", "group": "g2"},
+        {"content": "c", "group": "g1"},
+        {"content": "d", "group": "g2"},
+    ])
+    batches = _batches(list(todos.items()), 2)
+    groups_per_batch = [{t.get("group") for t in b.values()} for b in batches]
+    assert all(len(g) == 1 for g in groups_per_batch)  # each batch is a single group, not a mix
+
+
+def test_ungrouped_batches_preserve_order() -> None:
+    todos = _todos(6)
+    batches = _batches(list(todos.items()), 2)
+    assert [t["id"] for b in batches for t in b.values()] == [f"td{i:04d}" for i in range(6)]
+
+
+# --- sampled verification ---------------------------------------------------
+def test_verify_samples_and_reverts() -> None:
+    todos = {f"td{i:04d}": {"id": f"td{i:04d}", "content": f"t{i}", "status": "done", "result": "r"} for i in range(20)}
+
+    def verifier(worker_id: str, batch: dict) -> dict:  # noqa: ARG001
+        # Reject any to-do whose id ends in 0 (a stand-in for "confidently wrong").
+        return {tid: {**t, "status": "failed" if tid.endswith("0") else "done"} for tid, t in batch.items()}
+
+    delta, sampled, reverted = verify(todos, verifier, sample_rate=1.0, batch_size=5, concurrency=4)
+    assert sampled == 20  # sample_rate 1.0 -> all done to-dos re-checked
+    assert reverted == 2  # td0000, td0010
+    assert set(delta) == {"td0000", "td0010"}
+    assert all(t["status"] == "failed" for t in delta.values())
+
+
+def test_verify_is_sublinear_sample() -> None:
+    todos = {f"td{i:04d}": {"id": f"td{i:04d}", "content": "", "status": "done"} for i in range(100)}
+    sampled_seen: list[int] = []
+
+    def verifier(worker_id: str, batch: dict) -> dict:  # noqa: ARG001
+        sampled_seen.append(len(batch))
+        return batch  # confirm everything
+
+    _, sampled, reverted = verify(todos, verifier, sample_rate=0.1, batch_size=50)
+    assert sampled == 10  # ~1 in 10, not all 100
+    assert reverted == 0
+    assert sum(sampled_seen) == 10
+
+
+def test_verify_noop_when_no_done() -> None:
+    todos = {"1": {"id": "1", "content": "", "status": "pending"}}
+    delta, sampled, reverted = verify(todos, lambda _w, b: b, sample_rate=0.5)
+    assert (delta, sampled, reverted) == ({}, 0, 0)
+
+
+def test_tasklist_agent_has_verify_tool() -> None:
+    from deepflow import create_tasklist_agent  # noqa: PLC0415
+
+    agent = create_tasklist_agent(model=_build_model())
+    names = _tool_names(agent)
+    assert {"process_todos", "verify_todos", "count_todos", "add_todos"} <= names
 
 
 def test_aggregate_counts_by_status() -> None:

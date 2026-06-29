@@ -35,21 +35,24 @@ from deepflow.tasklist import (
     TaskListMiddleware,
     TaskListState,
     Todo,
+    TodoSpec,
     TodoStoreMiddleware,
     aggregate,
     dispatch,
     make_todos,
     make_worker,
+    verify,
     worker_tool_names,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "CompiledSubAgent",
     "TaskListMiddleware",
     "TaskListState",
     "Todo",
+    "TodoSpec",
     "TodoStoreMiddleware",
     "WorkflowMiddleware",
     "WorkflowPhase",
@@ -69,5 +72,6 @@ __all__ = [
     "plan_payload",
     "render_prompt",
     "validate_workflow",
+    "verify",
     "worker_tool_names",
 ]

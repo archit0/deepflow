@@ -132,6 +132,31 @@ result = agent.invoke({
 
 **Context management** — the orchestrator plans from **counts, never contents** (`O(log N)` — 10× the to-dos adds one digit, not 10× the tokens); each worker is handed only its batch (`O(batch)`); the store lives in state and never enters a prompt. That's what lets a single workflow drive thousands of tasks across a long-running job without its context exploding.
 
+#### "Done" means *verified* done
+
+A worker saying `done` isn't proof. deepflow gives you three independent ways to make completion real, all opt-in:
+
+```python
+from deepflow import make_todos
+
+tasks = make_todos([
+    # 1. deterministic check — the engine runs the command after the worker and
+    #    flips done -> failed if it doesn't pass. The model cannot fake this.
+    {"content": "Write unit tests for payments.py", "check": "pytest tests/test_payments.py -q"},
+    # 2. group — related to-dos co-locate in one worker (no two workers fight one file)
+    {"content": "Refactor payments.py", "group": "payments"},
+    {"content": "Update payments docs",  "group": "payments"},
+    # 3. plain content still works
+    "Draft an OpenAPI spec for POST /refunds",
+])
+```
+
+- **`check`** (deterministic) — a shell command (`exit 0` == pass). After a worker marks a to-do `done`, the engine runs the check and reverts it to `failed` if it doesn't pass. Verification is owned by code, not the model — the strongest and cheapest guarantee.
+- **Evidence** (self-check) — for check-less to-dos, workers must write a concrete `result` ("pytest: 5 passed"), not a restatement of the task — an auditable trail.
+- **`verify_todos(instruction, sample_rate=0.1)`** (sampled second opinion) — an *independent* agent re-checks a **sample** of completed to-dos and flips confidently-wrong ones back to `failed`. Sampling keeps it sublinear (≈1 in 10), so it scales to thousands. Then re-run `process_todos` to drain the reverts.
+
+The orchestrator loop is therefore: `count_todos → process_todos → verify_todos → process_todos … until nothing is pending/failed` — and it only ever sees counts at each step.
+
 > **Workers are Deep Agents minus orchestration.** Every worker has the full Deep Agent toolset — filesystem, `execute`, summarization/compaction — **but no `task` and no `workflow`**: it drains its assigned slice and nothing more. Disjoint batches ⇒ no race, no double-processing.
 
 *Prefer a dedicated task-list agent without the `workflow` tool? `create_tasklist_agent(model, batch_size=...)` is the same store and dispatch on its own.*
@@ -172,7 +197,10 @@ for mode, chunk in agent.stream(
 | `batch_start` | a worker gets its slice | `worker`, `size`, `todos[]` |
 | `worker_read` | a worker calls `read_todos` | `worker`, `returned`, `ids` |
 | `batch_done` | a worker finished its slice | `worker`, `results[]` |
+| `check_failed` | a `check` reverted a `done` to-do | `worker`, `id`, `output` |
 | `tasklist_done` | dispatch finished | `done`, `failed`, `pending`, `in_progress` |
+| `verify_plan` | a sampled verification began | `done`, `sampled`, `batch_size`, `worker_count` |
+| `verify_done` | verification finished | `sampled`, `reverted` |
 
 The names live in `deepflow.events`, so the code that emits them and any reader never drift.
 

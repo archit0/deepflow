@@ -64,3 +64,17 @@ BATCH_DONE = "batch_done"
 TASKLIST_DONE = "tasklist_done"
 """Dispatch finished. Fields: ``done``, ``failed``, ``pending``, ``in_progress``
 — the final status rollup the orchestrator receives (its whole footprint)."""
+
+CHECK_FAILED = "check_failed"
+"""A completed to-do's deterministic acceptance ``check`` failed, so the engine
+flipped it ``done`` → ``failed``. Fields: ``worker``, ``id``, ``output`` — proof
+that "done" means *verified* done, not self-attested."""
+
+VERIFY_PLAN = "verify_plan"
+"""A sampled verification pass began. Fields: ``done``, ``sampled``,
+``batch_size``, ``worker_count`` — how much of the completed work is being
+independently re-checked (sublinear QA, not a full pass)."""
+
+VERIFY_DONE = "verify_done"
+"""Verification finished. Fields: ``sampled``, ``reverted`` — how many sampled
+to-dos were re-checked and how many were flipped back to ``failed`` for retry."""

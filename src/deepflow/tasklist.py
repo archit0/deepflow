@@ -30,6 +30,7 @@ Every stage streams (see :mod:`deepflow.events`): ``tasklist_plan`` →
 import contextvars
 import json
 import logging
+import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,12 +57,24 @@ Status = Literal["pending", "in_progress", "done", "failed"]
 
 
 class Todo(TypedDict):
-    """One unit of work in the store."""
+    """One unit of work in the store.
+
+    ``check`` and ``group`` are optional and make "done" mean *verified* done:
+
+    - ``check``: a shell command (exit 0 == pass). After a worker marks the to-do
+      ``done``, the engine runs the check deterministically and flips it to
+      ``failed`` if it does not pass — so completion is verified by code, not
+      self-attested by the model.
+    - ``group``: to-dos sharing a group are co-located in the same worker batch
+      (e.g. everything touching one file goes to one worker, avoiding clashes).
+    """
 
     id: str
     content: str
     status: Status
     result: NotRequired[str]
+    check: NotRequired[str]
+    group: NotRequired[str]
 
 
 def _merge(old: dict[str, Todo] | None, new: Any) -> dict[str, Todo]:
@@ -97,16 +110,31 @@ def aggregate(todos: Any) -> dict[str, int]:
     return counts
 
 
-def make_todos(items: Sequence[str]) -> dict[str, Todo]:
-    """Build an initial task store from a list of contents (each starts pending).
+TodoSpec = str | dict[str, Any]
+"""A to-do seed: a plain content ``str``, or a dict with ``content`` plus optional
+``check`` (acceptance command) and ``group`` (co-location key)."""
+
+
+def make_todos(items: Sequence[TodoSpec]) -> dict[str, Todo]:
+    """Build an initial task store from a list of task specs (each starts pending).
+
+    Each item is either a plain ``str`` (the to-do content) or a dict with
+    ``content`` plus optional ``check`` and ``group`` (see :class:`Todo`). So
+    ``make_todos(["do X", {"content": "do Y", "check": "pytest -q"}])`` mixes both.
 
     Convenience for seeding a run: ``agent.invoke({"messages": ..., "tasks":
     make_todos([...])})``.
     """
     store: dict[str, Todo] = {}
-    for content in items:
+    for item in items:
+        spec: dict[str, Any] = {"content": item} if isinstance(item, str) else dict(item)
         tid = "td_" + uuid.uuid4().hex[:8]
-        store[tid] = {"id": tid, "content": content, "status": "pending"}
+        todo: Todo = {"id": tid, "content": spec["content"], "status": "pending"}
+        if spec.get("check"):
+            todo["check"] = spec["check"]
+        if spec.get("group"):
+            todo["group"] = spec["group"]
+        store[tid] = todo
     return store
 
 
@@ -136,7 +164,61 @@ class _Emitter:
 
 
 def _batches(items: list[tuple[str, Todo]], size: int) -> list[dict[str, Todo]]:
-    return [dict(items[i : i + size]) for i in range(0, len(items), size)]
+    """Chunk into batches of ``size``, keeping same-``group`` to-dos contiguous.
+
+    To-dos sharing a ``group`` are clustered (in first-seen order) so they land in
+    the same worker where possible; ungrouped to-dos keep their original order. A
+    group larger than ``size`` still splits across batches — batch size is a hard cap.
+    """
+    buckets: dict[str, list[tuple[str, Todo]]] = {}
+    order: list[str] = []
+    for tid, todo in items:
+        key = todo.get("group") or f"\x00{tid}"  # ungrouped -> unique key = its own id
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append((tid, todo))
+    ordered = [item for key in order for item in buckets[key]]
+    return [dict(ordered[i : i + size]) for i in range(0, len(ordered), size)]
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic acceptance checks: the engine verifies "done", the model can't fake it
+# --------------------------------------------------------------------------- #
+CheckRunner = Callable[[str], tuple[bool, str]]
+"""Runs a to-do's ``check`` command and returns ``(passed, output)``."""
+
+
+def _run_check(command: str, *, timeout: float = 120.0) -> tuple[bool, str]:
+    """Run a to-do's acceptance ``check`` shell command. Returns ``(passed, output)``.
+
+    Exit code 0 == passed. This is deterministic verification owned by the engine
+    (not the model): a worker cannot mark a checked to-do done unless the command
+    actually passes.
+    """
+    try:
+        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout, check=False)  # noqa: S602 - checks are user-authored acceptance commands
+    except subprocess.TimeoutExpired:
+        return False, f"check timed out after {timeout:.0f}s"
+    except Exception as exc:  # noqa: BLE001 - a broken check command must fail the to-do, not the run
+        return False, str(exc)
+    output = (proc.stdout + proc.stderr).strip()
+    return proc.returncode == 0, output[-300:]
+
+
+def _verify_checks(updated: dict[str, Todo], check_runner: CheckRunner, emit: "_Emitter", worker: str) -> dict[str, Todo]:
+    """Run each completed to-do's ``check`` and flip ``done`` → ``failed`` if it fails."""
+    verified: dict[str, Todo] = {}
+    for tid, todo in updated.items():
+        check = todo.get("check")
+        if check and todo.get("status") == "done":
+            passed, output = check_runner(check)
+            if not passed:
+                verified[tid] = {**todo, "status": "failed", "result": f"check failed: {output}"[:500]}
+                emit(events.CHECK_FAILED, worker=worker, id=tid, output=output[:300])
+                continue
+        verified[tid] = todo
+    return verified
 
 
 def _status_counts(todos: dict[str, Todo]) -> dict[str, int]:
@@ -151,12 +233,17 @@ def dispatch(
     batch_size: int = DEFAULT_BATCH_SIZE,
     concurrency: int = DEFAULT_MAX_WORKERS,
     statuses: tuple[str, ...] = ("pending",),
+    check_runner: CheckRunner | None = None,
     emit: _Emitter | None = None,
 ) -> tuple[dict[str, Todo], dict[str, int], int]:
     """Partition the matching to-dos into disjoint batches and drain them.
 
     Each batch is handed to one ``worker_fn`` call, so a worker only ever sees
     ``batch_size`` to-dos. Batches run concurrently up to ``concurrency``.
+
+    Any completed to-do that carries a ``check`` is verified deterministically by
+    ``check_runner`` (default :func:`_run_check`); a failing check flips it back to
+    ``failed`` — so a worker cannot self-attest completion of a checked to-do.
 
     Context is captured **here** (the caller's / tool's thread) and replayed in
     each worker thread via ``ctx.run``, so callbacks/tracing propagate correctly.
@@ -165,6 +252,7 @@ def dispatch(
     to-dos (safe to merge back into the store).
     """
     emit = emit or _Emitter(None)
+    check_runner = check_runner or _run_check
     # Reset matched to-dos to `pending` in the worker's batch view, so a retry
     # (statuses includes "failed") is drained even if a worker filters on pending.
     pending = [(tid, {**todo, "status": "pending"}) for tid, todo in todos.items() if todo["status"] in statuses]
@@ -190,6 +278,7 @@ def dispatch(
                 logger.exception("deepflow task-list worker '%s' failed", wid)
                 emit(events.BATCH_DONE, worker=wid, results=[], error=str(exc))
                 continue
+            updated = _verify_checks(updated, check_runner, emit, wid)
             for read in reads:
                 emit(events.WORKER_READ, worker=wid, **read)
             results = [{"id": tid, "status": u["status"], "result": u.get("result", "")} for tid, u in updated.items()]
@@ -261,8 +350,11 @@ def store_tools() -> list[BaseTool]:
 WORKER_PROMPT = (
     "You are a focused worker. You have been handed a small batch of to-dos — ONLY yours, nobody else's.\n"
     "Call `read_todos()` (no filter) to see EVERY to-do in your batch, do each one with your tools, then call "
-    "`write_todos(id, 'done', <short result>)` for it (or `'failed'` with the reason). Cover every to-do you were "
-    "given — including any that come back as `failed` on a retry — then stop. You cannot create sub-agents or "
+    "`write_todos(id, 'done', <result>)` for it (or `'failed'` with the reason). Cover every to-do you were "
+    "given — including any that come back as `failed` on a retry — then stop.\n"
+    "Make the `result` concrete EVIDENCE of completion, not a restatement of the task (e.g. 'pytest: 5 passed', "
+    "'wrote 42-line spec to refunds.yaml'). If a to-do carries a `check` command, the engine runs it after you "
+    "and will reject your `done` if it fails — so actually make the check pass. You cannot create sub-agents or "
     "workflows; just drain your batch."
 )
 
@@ -273,16 +365,28 @@ You manage a potentially huge to-do store that you must NOT read in full. Plan f
 - `count_todos()` — the cheap status rollup. Start here.
 - `add_todos([...])` — create to-dos (use this if the user gave you an objective instead of a ready-made list).
 - `process_todos(instruction, batch_size?, max_workers?)` — THE dispatcher. It partitions the pending to-dos into
-  disjoint batches and runs workers in parallel; each worker drains only its batch and writes status. You get back a
-  status rollup, not the contents. Re-run it to retry anything still pending/failed.
+  disjoint batches and runs workers in parallel; each worker drains only its batch and writes status. To-dos that
+  carry a `check` are verified by the engine (a failing check flips `done`→`failed`). You get back a status rollup,
+  not the contents. Re-run it to retry anything still pending/failed.
+- `verify_todos(instruction, sample_rate?)` — independently re-check a SAMPLE of completed to-dos to catch
+  confidently-wrong work; rejected to-dos flip back to `failed`. Then re-run `process_todos` to fix them.
 
-Choose `batch_size` so each worker gets a sane slice (e.g. ~25-200 to-dos), never one worker per to-do."""
+Loop to convergence: `count_todos` → `process_todos` → (optionally) `verify_todos` → `process_todos` again to drain
+any failures → repeat until nothing is pending/failed. Choose `batch_size` so each worker gets a sane slice (e.g.
+~25-200 to-dos), never one worker per to-do."""
 
 
 class _ProcessArgs(BaseModel):
     instruction: str = Field(description="What each worker should do with every to-do in its batch.")
     batch_size: int | None = Field(default=None, description="To-dos per worker (defaults to the agent's configured value).")
     max_workers: int | None = Field(default=None, description="Max workers running at once (defaults to the agent's configured value).")
+
+
+class _VerifyArgs(BaseModel):
+    instruction: str = Field(description="How to judge whether a completed to-do is genuinely done.")
+    sample_rate: float = Field(default=0.1, description="Fraction of done to-dos to re-check (0-1). Sublinear QA, not a full pass.")
+    batch_size: int | None = Field(default=None, description="To-dos per verifier (defaults to the agent's configured value).")
+    max_workers: int | None = Field(default=None, description="Max verifiers running at once (defaults to the agent's configured value).")
 
 
 # --------------------------------------------------------------------------- #
@@ -407,6 +511,85 @@ def agent_worker_fn(worker: Any, instruction: str) -> WorkerFn:
 
 
 # --------------------------------------------------------------------------- #
+# Sampled verification: an independent agent re-checks a fraction of done to-dos
+# --------------------------------------------------------------------------- #
+# A verifier takes (worker_id, batch of done to-dos) and returns the batch with any
+# incorrectly-completed to-dos flipped to ``failed``.
+VerifierFn = Callable[[str, dict[str, Todo]], dict[str, Todo]]
+
+
+def verify(
+    todos: dict[str, Todo],
+    verifier_fn: VerifierFn,
+    *,
+    sample_rate: float = 0.1,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    concurrency: int = DEFAULT_MAX_WORKERS,
+    emit: _Emitter | None = None,
+) -> tuple[dict[str, Todo], int, int]:
+    """Independently re-check a deterministic SAMPLE of ``done`` to-dos.
+
+    A verifier sees each sampled to-do *with its result* and either confirms it
+    (leaves ``done``) or rejects it (flips to ``failed`` with a reason) so the
+    existing retry path re-dispatches it. Sampling keeps cost sublinear: at
+    ``sample_rate=0.1`` only ~1 in 10 completed to-dos is re-checked. The sample is
+    a deterministic stride (no RNG), so a run is reproducible.
+
+    Returns ``(delta, sampled, reverted)`` — ``delta`` holds only the flipped
+    to-dos (safe to merge back into the store).
+    """
+    emit = emit or _Emitter(None)
+    done = [(tid, t) for tid, t in todos.items() if t.get("status") == "done"]
+    if not done or sample_rate <= 0:
+        emit(events.VERIFY_DONE, sampled=0, reverted=0)
+        return {}, 0, 0
+    step = max(1, round(1 / sample_rate))
+    sampled = done[::step]
+    batches = _batches(sampled, batch_size)
+    emit(events.VERIFY_PLAN, done=len(done), sampled=len(sampled), batch_size=batch_size, worker_count=len(batches))
+
+    delta: dict[str, Todo] = {}
+    ctxs = [contextvars.copy_context() for _ in batches]
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = {pool.submit(ctxs[i].run, verifier_fn, f"v{i}", batch): i for i, batch in enumerate(batches)}
+        for future in as_completed(futures):
+            vid = f"v{futures[future]}"
+            try:
+                judged = future.result()
+            except Exception as exc:
+                logger.exception("deepflow verifier '%s' failed", vid)
+                emit(events.BATCH_DONE, worker=vid, results=[], error=str(exc))
+                continue
+            reverted = {tid: t for tid, t in judged.items() if t.get("status") == "failed"}
+            if reverted:
+                results = [{"id": tid, "status": "failed", "result": t.get("result", "")} for tid, t in reverted.items()]
+                emit(events.BATCH_DONE, worker=vid, results=results)
+            delta.update(reverted)
+    emit(events.VERIFY_DONE, sampled=len(sampled), reverted=len(delta))
+    return delta, len(sampled), len(delta)
+
+
+def agent_verifier_fn(worker: Any, instruction: str) -> VerifierFn:
+    """Adapt a worker agent into a :data:`VerifierFn`: judge each completed to-do.
+
+    The verifier is seeded with the sampled to-dos *including their result* and must
+    confirm (``done``) or reject (``failed``) each — it never sees the rest of the store.
+    """
+
+    def fn(worker_id: str, batch: dict[str, Todo]) -> dict[str, Todo]:  # noqa: ARG001 - id is used by the caller for events
+        prompt = (
+            f"{instruction}\n\nYou are VERIFYING already-completed to-dos — do NOT redo the work. For each one, "
+            "read it with `read_todos()` (no filter), inspect the actual artifact with your tools, and judge whether "
+            "the recorded result genuinely satisfies the to-do. Call `write_todos(id, 'done', <why it is ok>)` to "
+            "CONFIRM, or `write_todos(id, 'failed', <what is wrong>)` to REJECT. Judge every to-do you were given, then stop."
+        )
+        result = worker.invoke({"messages": [HumanMessage(content=prompt)], "tasks": dict(batch)})
+        return result.get("tasks") or dict(batch)
+
+    return fn
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator middleware: count_todos + add_todos + process_todos
 # --------------------------------------------------------------------------- #
 def _augment(request: ModelRequest[ContextT], system_prompt: str | None) -> ModelRequest[ContextT]:
@@ -457,7 +640,7 @@ class TaskListMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
         self._worker_factory = worker_factory or (lambda: make_worker(model, tools=tools, backend=backend, system_prompt=worker_system_prompt))
         self.system_prompt = system_prompt
         orchestrator_tools = [t for t in store_tools() if t.name in {"count_todos", "add_todos"}]
-        self.tools = [*orchestrator_tools, self._process_tool()]
+        self.tools = [*orchestrator_tools, self._process_tool(), self._verify_tool()]
 
     def _process_tool(self) -> BaseTool:
         def process_todos(instruction: str, runtime: ToolRuntime, batch_size: int | None = None, max_workers: int | None = None) -> Command:
@@ -476,6 +659,31 @@ class TaskListMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
             name="process_todos",
             description="Drain all pending/failed to-dos: partition into disjoint batches, run workers in parallel, return a status rollup.",
             args_schema=_ProcessArgs,
+            infer_schema=False,
+        )
+
+    def _verify_tool(self) -> BaseTool:
+        def verify_todos(
+            instruction: str,
+            runtime: ToolRuntime,
+            sample_rate: float = 0.1,
+            batch_size: int | None = None,
+            max_workers: int | None = None,
+        ) -> Command:
+            emit = _Emitter(getattr(runtime, "stream_writer", None))
+            todos = runtime.state.get("tasks") or {}
+            size = batch_size or self._batch_size
+            workers = max_workers or self._max_workers
+            verifier_fn = agent_verifier_fn(self._worker_factory(), instruction)
+            delta, sampled, reverted = verify(todos, verifier_fn, sample_rate=sample_rate, batch_size=size, concurrency=workers, emit=emit)
+            summary = f"Verified a sample of {sampled} done to-dos; reverted {reverted} to failed. Re-run process_todos to retry them."
+            return Command(update={"tasks": delta, "messages": [ToolMessage(summary, tool_call_id=runtime.tool_call_id)]})
+
+        return StructuredTool.from_function(
+            func=verify_todos,
+            name="verify_todos",
+            description="Independently re-check a SAMPLE of completed to-dos; flip wrong ones back to failed for retry.",
+            args_schema=_VerifyArgs,
             infer_schema=False,
         )
 
